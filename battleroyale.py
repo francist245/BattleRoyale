@@ -390,10 +390,18 @@ def sfx(name, vol=0.6):
 ARENA = 170          # ground is ARENA x ARENA, centred on origin
 HALF = ARENA / 2
 cover = []           # cover entities (have colliders)
+BLOCKERS = []        # (cx, cz, half_x, half_z) AABB footprints for enemy nav
 enemies = []
 tracers = []
 pickups = []
 sparks = []
+
+
+def _register_blocker(e, pad=0.7):
+    """Record an entity's xz footprint so enemies can't walk through it."""
+    hx = abs(e.scale_x) * 0.5 + pad
+    hz = abs(e.scale_z) * 0.5 + pad
+    BLOCKERS.append((e.x, e.z, hx, hz))
 
 light = DirectionalLight(y=3, z=-2, rotation=(45, -30, 0))
 light.color = C(255, 250, 235)
@@ -483,6 +491,11 @@ def build_world():
                        color=C(255, 255, 255))
             cover.append(e)
 
+    # build the enemy-navigation blocker footprints from every solid piece
+    BLOCKERS.clear()
+    for e in cover:
+        _register_blocker(e)
+
 
 # ============================================================================
 # WEAPONS
@@ -491,8 +504,8 @@ def build_world():
 WEAPONS = {
     'Rifle':   dict(dmg=15, rate=0.10, mag=30, rng=95, pellets=1,
                     spread=2.6, auto=True, snd='shoot'),
-    'Shotgun': dict(dmg=12, rate=0.72, mag=6, rng=34, pellets=7,
-                    spread=10.0, auto=False, snd='sgun'),
+    'Shotgun': dict(dmg=22, rate=0.72, mag=6, rng=36, pellets=8,
+                    spread=9.5, auto=False, snd='sgun'),
     'Sniper':  dict(dmg=95, rate=1.05, mag=5, rng=210, pellets=1,
                     spread=0.3, auto=False, snd='snipe'),
 }
@@ -556,6 +569,10 @@ class Enemy:
         self.root.combine(auto_destroy=True)
         self.root.color = color.white
         self.base_col = color.white
+        # soft contact shadow to ground the enemy visually
+        self.shadow = Entity(parent=self.root, model='quad', rotation_x=90,
+                             scale=self.size * 1.9, y=0.03,
+                             color=C(0, 0, 0, 90))
         self.fire_cd = random.uniform(0.3, cfg['fire'])
         self.melee_cd = 0.0
         self.flash = 0.0
@@ -564,6 +581,10 @@ class Enemy:
         self.strafe_t = random.uniform(1, 3)
         self.is_boss = cfg['boss']
         self.can_shoot = False
+        self.foe = None
+        self.foe_t = random.uniform(1.0, 5.0)
+        self.wander_a = random.uniform(0, 6.28)
+        self.wander_t = random.uniform(1.0, 3.0)
         enemies.append(self)
 
     @property
@@ -577,23 +598,27 @@ class Enemy:
     def center(self):
         return Vec3(self.root.x, self.size * 1.3, self.root.z)
 
-    def hurt(self, dmg):
+    def hurt(self, dmg, by_player=True):
         if self.hp <= 0:
             return
         self.hp -= dmg
         self.flash = 0.12
         self.root.color = color.red
-        sfx('hit', 0.4)
+        if by_player:
+            sfx('hit', 0.4)
         if self.hp <= 0:
-            self.die()
+            self.die(by_player)
 
-    def die(self):
+    def die(self, by_player=True):
         if self in enemies:
             enemies.remove(self)
-        GAME.kills += 1
-        sfx('kill', 0.5)
+        if by_player:
+            GAME.kills += 1
+            sfx('kill', 0.5)
         burst(self.center(), C(*self.cfg['col']), n=8 if not self.is_boss else 22)
-        if self.is_boss or random.random() < 0.12:
+        death_pop(self.root.x, self.root.z, self.size,
+                  C(*self.cfg['col']), big=self.is_boss)
+        if by_player and (self.is_boss or random.random() < 0.12):
             spawn_pickup(self.root.x, self.root.z,
                          'health' if random.random() < 0.5 else 'ammo')
         destroy(self.root)
@@ -604,11 +629,50 @@ class Enemy:
         destroy(self.root)
 
     def step(self, dt):
+        # An enemy killed earlier this frame (e.g. by infighting) may still be
+        # in the caller's snapshot list; skip it so we never touch a destroyed
+        # NodePath.
+        if self.hp <= 0 or self not in enemies:
+            return
         p = GAME.player
-        px, pz = p.x, p.z
-        dx, dz = px - self.root.x, pz - self.root.z
-        dist = math.hypot(dx, dz) or 0.001
         cfg = self.cfg
+        # Decide whom to engage. Only the nearest few (can_shoot) ever pursue the
+        # player. Everyone else hunts a nearby rival (infighting) or wanders --
+        # they never march on the player, so you don't get dog-piled.
+        dist_p = math.hypot(p.x - self.root.x, p.z - self.root.z)
+        self.foe_t -= dt
+        if self.foe_t <= 0:
+            self.foe_t = random.uniform(2.0, 5.0)
+            self._pick_foe(dist_p)
+        if self.foe is not None and (self.foe.hp <= 0 or self.foe not in enemies):
+            self.foe = None
+        foe = None if self.can_shoot else self.foe
+
+        mode = 'player' if self.can_shoot else ('foe' if foe is not None
+                                                else 'wander')
+        if mode == 'player':
+            tx, tz = p.x, p.z
+        elif mode == 'foe':
+            tx, tz = foe.root.x, foe.root.z
+        else:
+            # wander: drift along a slowly-turning heading.
+            self.wander_t -= dt
+            if self.wander_t <= 0:
+                self.wander_t = random.uniform(1.5, 3.5)
+                self.wander_a += random.uniform(-1.2, 1.2)
+            tx = self.root.x + math.cos(self.wander_a) * 8
+            tz = self.root.z + math.sin(self.wander_a) * 8
+
+        # Non-shooters NEVER crowd the player: if one drifts within 22u of you
+        # (chasing a foe or wandering), it steers straight away. Only the 3
+        # nearest enemies (can_shoot) are allowed to close in.
+        if not self.can_shoot and dist_p < 22:
+            ax, az = self.root.x - p.x, self.root.z - p.z
+            an = math.hypot(ax, az) or 0.001
+            tx = self.root.x + (ax / an) * 10
+            tz = self.root.z + (az / an) * 10
+        dx, dz = tx - self.root.x, tz - self.root.z
+        dist = math.hypot(dx, dz) or 0.001
 
         # damage flash recover
         if self.flash > 0:
@@ -629,34 +693,31 @@ class Enemy:
 
         # ---- movement ----
         moving = False
+        mvx = mvz = 0.0
         if in_storm and dcenter > 1:
             # flee into the zone
             ux, uz = dcx / dcenter, dcz / dcenter
             sp = cfg['spd'] * 1.15
-            self.root.x += ux * sp * dt
-            self.root.z += uz * sp * dt
-            moving = True
+            mvx, mvz = ux * sp * dt, uz * sp * dt
         else:
             ux, uz = dx / dist, dz / dist
             standoff = 1.6 if cfg['rng'] < 28 else cfg['rng'] * 0.45
             if dist > standoff + 1:
                 sp = cfg['spd']
-                self.root.x += ux * sp * dt
-                self.root.z += uz * sp * dt
-                moving = True
+                mvx, mvz = ux * sp * dt, uz * sp * dt
             elif dist < standoff - 1.5:
-                self.root.x -= ux * cfg['spd'] * 0.6 * dt
-                self.root.z -= uz * cfg['spd'] * 0.6 * dt
-                moving = True
+                mvx = -ux * cfg['spd'] * 0.6 * dt
+                mvz = -uz * cfg['spd'] * 0.6 * dt
             else:
-                # strafe around the player
+                # strafe around the target
                 self.strafe_t -= dt
                 if self.strafe_t <= 0:
                     self.strafe *= -1
                     self.strafe_t = random.uniform(1, 2.5)
-                self.root.x += -uz * self.strafe * cfg['spd'] * 0.5 * dt
-                self.root.z += ux * self.strafe * cfg['spd'] * 0.5 * dt
-                moving = True
+                mvx = -uz * self.strafe * cfg['spd'] * 0.5 * dt
+                mvz = ux * self.strafe * cfg['spd'] * 0.5 * dt
+        if mvx or mvz:
+            moving = self._move(mvx, mvz)
 
         # keep inside the arena
         self.root.x = clamp(self.root.x, -HALF + 2, HALF - 2)
@@ -672,19 +733,41 @@ class Enemy:
         elif self.root.y > 0.001:
             self.root.y *= 0.8
 
-        # ---- melee ----
+        # ---- combat ----
         self.melee_cd -= dt
+        self.fire_cd -= dt
+        if foe is not None and not in_storm:
+            # brawl with another enemy (infighting)
+            if dist < 2.1 and self.melee_cd <= 0:
+                foe.hurt(max(3, cfg['dmg'] // 2), by_player=False)
+                self.melee_cd = 0.9
+            # the melee may have just killed the foe; bail if so
+            if foe.hp <= 0 or foe not in enemies:
+                self.foe = None
+                return
+            if self.fire_cd <= 0 and dist < cfg['rng']:
+                self.fire_cd = cfg['fire'] * random.uniform(1.1, 1.8)
+                blocked = self._blocked(self.center(), foe.center())
+                # draw the tracer before the shot can destroy the foe's mesh
+                if math.hypot(self.root.x - p.x, self.root.z - p.z) < 60:
+                    tracer(self.center(),
+                           foe.center() if not blocked else self.center(),
+                           C(255, 150, 70))
+                if not blocked and random.random() < cfg['acc']:
+                    foe.hurt(cfg['dmg'], by_player=False)
+            return
+
+        # ---- melee vs player ----
         if self.can_shoot and dist < 2.1 and self.melee_cd <= 0:
             GAME.hurt_player(max(4, cfg['dmg'] // 2))
             self.melee_cd = 0.9
 
-        # ---- shooting ----
-        self.fire_cd -= dt
+        # ---- shooting vs player ----
         if (self.can_shoot and self.fire_cd <= 0 and dist < cfg['rng']
                 and not in_storm):
             self.fire_cd = cfg['fire'] * random.uniform(0.8, 1.25)
             origin = self.center()
-            target = Vec3(px, 1.4, pz)
+            target = Vec3(p.x, 1.4, p.z)
             blocked = self._blocked(origin, target)
             tracer(origin, target if not blocked else
                    origin + (target - origin) * 0.6, C(255, 120, 60))
@@ -694,6 +777,28 @@ class Enemy:
                     acc *= 0.7
                 if random.random() < acc:
                     GAME.hurt_player(cfg['dmg'])
+
+    def _solid(self, nx, nz):
+        """True if point (nx,nz) sits inside any cover footprint."""
+        r = self.size * 0.5
+        for bx, bz, hx, hz in BLOCKERS:
+            if abs(nx - bx) < hx + r and abs(nz - bz) < hz + r:
+                return True
+        return False
+
+    def _move(self, mvx, mvz):
+        """Move by (mvx,mvz) but slide along walls instead of clipping through.
+
+        Returns True if the enemy actually moved."""
+        x, z = self.root.x, self.root.z
+        moved = False
+        if not self._solid(x + mvx, z):      # try full X
+            self.root.x = x + mvx
+            moved = moved or mvx != 0
+        if not self._solid(self.root.x, z + mvz):  # then Z
+            self.root.z = z + mvz
+            moved = moved or mvz != 0
+        return moved
 
     def _blocked(self, origin, target):
         d = (target - origin)
@@ -706,6 +811,26 @@ class Enemy:
             return hit.hit
         except Exception:
             return False
+
+    def _pick_foe(self, dist_p):
+        """Pick a nearby rival to brawl with (infighting).
+
+        The nearest few enemies (can_shoot) ignore this and focus the player;
+        every other enemy hunts the closest rival within range, so the bulk of
+        the lobby fights each other instead of dog-piling the player."""
+        if self.can_shoot:
+            self.foe = None
+            return
+        best = None
+        bd = 45.0
+        for e in enemies:
+            if e is self or e.hp <= 0 or e.can_shoot:
+                continue
+            d = math.hypot(e.root.x - self.root.x, e.root.z - self.root.z)
+            if d < bd:
+                bd = d
+                best = e
+        self.foe = best
 
 
 # ============================================================================
@@ -726,6 +851,28 @@ def tracer(a, b, col=C(255, 240, 160)):
     if len(tracers) > 70:
         old = tracers.pop(0)
         destroy(old[0])
+
+
+def death_pop(x, z, size, col, big=False):
+    """A quick expanding ground shockwave + flash when an enemy dies."""
+    s0 = size * 0.8
+    ring = Entity(model='quad', rotation_x=90, position=(x, 0.12, z),
+                  scale=s0, double_sided=True,
+                  color=C(col[0], col[1], col[2], 200))
+    try:
+        ring.animate_scale(s0 * (7 if big else 4.5), duration=0.35,
+                           curve=curve.out_quad)
+        ring.fade_out(duration=0.35)
+    except Exception:
+        pass
+    destroy(ring, delay=0.4)
+    flash = Entity(model='sphere', position=(x, size, z),
+                   scale=size * 1.2, color=C(255, 255, 240, 200))
+    try:
+        flash.fade_out(duration=0.18)
+    except Exception:
+        pass
+    destroy(flash, delay=0.22)
 
 
 def burst(pos, col, n=8):
@@ -757,8 +904,13 @@ def spawn_pickup(x, z, kind):
 # ============================================================================
 # GAME
 # ============================================================================
-START_ENEMIES = 150
-SHOOTER_CAP = 12        # only the nearest few enemies engage at once
+START_ENEMIES = 12      # a small lobby; infighting thins it further
+SHOOTER_CAP = 3         # only the nearest 3 enemies ever target the player
+
+import os as _os
+_TEST_MODE = bool(_os.environ.get('SR_TEST'))
+_TEST_T = 0.0
+_TEST_QUIT = float(_os.environ.get('SR_TEST_QUIT', '20'))
 
 
 class Game:
@@ -766,6 +918,79 @@ class Game:
         self.player = None
         self.gun = None
         self.started = False
+        self.state = 'menu'
+        self.blink = 0.0
+        self.menu = None
+        self.menu_weapon = 'Rifle'
+        self.weapon_labels = []
+
+    # ---------- start screen ----------
+    def show_menu(self):
+        if self.menu is None:
+            self._build_menu()
+        for e in self.menu:
+            e.enable()
+        self._highlight_weapons()
+        self.state = 'menu'
+        self.blink = 0.0
+        mouse.locked = False
+        mouse.visible = True
+
+    def _build_menu(self):
+        self.menu = []
+        bg = Entity(parent=camera.ui, model='quad', scale=(2, 1),
+                    color=C(8, 10, 20, 235), z=1)
+        self.menu.append(bg)
+        title = Text("STORM ROYALE", parent=camera.ui, origin=(0, 0),
+                     y=0.30, scale=4, color=C(120, 200, 255))
+        sub = Text("Last one standing wins.", parent=camera.ui,
+                   origin=(0, 0), y=0.18, scale=1.4, color=C(220, 220, 230))
+        how = Text(
+            "WASD move   .   Mouse look   .   Left-click shoot   .   "
+            "Space jump\nStay out of the storm.  The other fighters are "
+            "battling each other too.",
+            parent=camera.ui, origin=(0, 0), y=0.05, scale=1.0,
+            color=C(170, 180, 200))
+        pick = Text("CHOOSE YOUR WEAPON   (press 1 / 2 / 3)",
+                    parent=camera.ui, origin=(0, 0), y=-0.07, scale=1.2,
+                    color=C(230, 230, 240))
+        self.menu += [title, sub, how, pick]
+        # three selectable weapon cards
+        info = {'Rifle': "1  RIFLE\nfast auto",
+                'Shotgun': "2  SHOTGUN\nbig close-range hit",
+                'Sniper': "3  SNIPER\none-shot at range"}
+        self.weapon_labels = []
+        for i, name in enumerate(WEAPON_ORDER):
+            t = Text(info[name], parent=camera.ui, origin=(0, 0),
+                     x=(i - 1) * 0.28, y=-0.20, scale=1.05,
+                     color=C(180, 180, 190))
+            self.weapon_labels.append((name, t))
+            self.menu.append(t)
+        self.prompt = Text("Press  ENTER  or  CLICK  to  DROP IN",
+                           parent=camera.ui, origin=(0, 0), y=-0.34,
+                           scale=1.6, color=C(255, 210, 90))
+        self.menu.append(self.prompt)
+
+    def _highlight_weapons(self):
+        for name, t in self.weapon_labels:
+            if name == self.menu_weapon:
+                t.color = C(120, 255, 150)
+                t.scale = 1.25
+            else:
+                t.color = C(160, 160, 175)
+                t.scale = 1.05
+
+    def _enter_game(self):
+        for e in self.menu:
+            e.disable()
+        self.state = 'playing'
+        if not self.started:
+            self.start()
+        else:
+            self.reset_state()
+            self.spawn_army(START_ENEMIES)
+        mouse.locked = True
+        mouse.visible = False
 
     # ---------- setup ----------
     def start(self):
@@ -781,23 +1006,25 @@ class Game:
         self.reset_state()
         self.spawn_army(START_ENEMIES)
         self.started = True
+        self.state = 'playing'
         JUKE.play('drop')
 
     def reset_state(self):
-        self.hp = 100
-        self.maxhp = 100
+        self.hp = 140
+        self.maxhp = 140
         self.kills = 0
-        self.weapon = 'Rifle'
+        self.weapon = self.menu_weapon
         self.mag = {k: WEAPONS[k]['mag'] for k in WEAPONS}
         self.fire_cd = 0.0
         self.reloading = 0.0
         self.recoil = 0.0
+        self.gunbob = 0.0
         self.hurt_t = 0.0
         self.hitmark_t = 0.0
         self.over = False
         self.win = False
         self.muzzle_t = 0.0
-        self.spawn_protect = 3.0
+        self.spawn_protect = 4.5
         self.regen_delay = 0.0
         self.next_dps = 1.0
         self.shrink_speed = 0.0
@@ -878,17 +1105,24 @@ class Game:
         bag = (['grunt'] * 34 + ['soldier'] * 24 + ['scout'] * 16 +
                ['heavy'] * 10 + ['sniper'] * 9 + ['elite'] * 5 +
                ['juggernaut'] * 2)
+        px, pz = self.player.x, self.player.z
         for _ in range(n):
             tier = random.choice(bag)
-            x = z = 0.0
-            for _try in range(8):
+            # pick the spot (of several tries) that is FARTHEST from the player
+            # so you never drop into a crowd; minimum 45u away.
+            best_x = best_z = 0.0
+            best_d = -1.0
+            for _try in range(12):
                 ang = random.uniform(0, 6.283)
-                rad = random.uniform(12, HALF * 0.9)
+                rad = random.uniform(20, HALF * 0.92)
                 x = math.cos(ang) * rad
                 z = math.sin(ang) * rad
-                if abs(x - self.player.x) + abs(z - self.player.z) > 14:
+                d = math.hypot(x - px, z - pz)
+                if d > best_d:
+                    best_d, best_x, best_z = d, x, z
+                if d > 45:
                     break
-            Enemy(tier, x, z)
+            Enemy(tier, best_x, best_z)
 
     # ---------- combat ----------
     def switch_weapon(self, name):
@@ -918,9 +1152,17 @@ class Game:
             return
         self.mag[self.weapon] -= 1
         self.fire_cd = w['rate']
-        self.recoil = min(8, self.recoil + 3)
-        self.muzzle_t = 0.04
+        kick = 5 if self.weapon == 'Shotgun' else (6 if self.weapon == 'Sniper'
+                                                   else 3)
+        self.recoil = min(12, self.recoil + kick)
+        # punchy, randomised muzzle flash
+        self.muzzle_t = 0.05
         self.muzzle.enabled = True
+        fs = 0.5 if self.weapon == 'Shotgun' else 0.32
+        self.muzzle.scale = fs * random.uniform(0.8, 1.3)
+        self.muzzle.rotation_z = random.uniform(0, 360)
+        self.muzzle.color = random.choice(
+            (C(255, 240, 140), C(255, 200, 90), C(255, 255, 200)))
         sfx(w['snd'], 0.55)
 
         muzzle_pos = camera.world_position + camera.forward * 0.6
@@ -973,9 +1215,9 @@ class Game:
     def hurt_player(self, dmg):
         if self.over or self.spawn_protect > 0:
             return
-        self.hp -= dmg
+        self.hp -= dmg * 0.5      # enemies hit at half strength -> survivable
         self.hurt_t = 0.4
-        self.regen_delay = 4.0
+        self.regen_delay = 2.5
         sfx('hurt', 0.45)
         if self.hp <= 0:
             self.hp = 0
@@ -1069,6 +1311,12 @@ class Game:
 
     # ---------- main loop ----------
     def update(self, dt):
+        if self.state == 'menu':
+            self.blink += dt
+            if self.menu:
+                self.prompt.color = C(255, 210, 90,
+                                      int(150 + 105 * abs(math.sin(self.blink * 3))))
+            return
         if not self.started or self.over:
             return
         dt = min(dt, 0.05)
@@ -1082,7 +1330,7 @@ class Game:
         if self.regen_delay > 0:
             self.regen_delay -= dt
         elif self.hp < self.maxhp:
-            self.hp = min(self.maxhp, self.hp + 5 * dt)
+            self.hp = min(self.maxhp, self.hp + 12 * dt)
 
         # firing
         self.fire_cd = max(0, self.fire_cd - dt)
@@ -1094,14 +1342,22 @@ class Game:
         elif held_keys['left mouse'] and w['auto']:
             self.fire()
 
-        # gun recoil / muzzle
+        # gun recoil / muzzle / walk-bob
         self.recoil = lerp(self.recoil, 0, dt * 12)
+        moving = (held_keys['w'] or held_keys['a'] or held_keys['s']
+                  or held_keys['d'])
+        self.gunbob += dt * (10 if moving else 4)
+        bob = math.sin(self.gunbob) * (0.012 if moving else 0.004)
+        sway = math.cos(self.gunbob * 0.5) * (0.010 if moving else 0.003)
         self.gun.rotation_x = -self.recoil
-        self.gun.y = -0.30 - self.recoil * 0.004
+        self.gun.y = -0.30 - self.recoil * 0.004 + bob
+        self.gun.x = 0.34 + sway
         if self.muzzle_t > 0:
             self.muzzle_t -= dt
             if self.muzzle_t <= 0:
                 self.muzzle.enabled = False
+        # crosshair opens up with recoil so shots feel weighty
+        self.crosshair.scale = 2 + self.recoil * 0.35
 
         # storm
         self.update_storm(dt)
@@ -1215,6 +1471,15 @@ class Game:
 
     # ---------- input ----------
     def input(self, key):
+        if self.state == 'menu':
+            if key in ('1', '2', '3'):
+                self.menu_weapon = WEAPON_ORDER[int(key) - 1]
+                self._highlight_weapons()
+                sfx('click', 0.4)
+            elif self.blink > 0.35 and key in ('enter', 'space',
+                                               'left mouse down'):
+                self._enter_game()
+            return
         if self.over:
             if key in ('enter', 'r'):
                 self.restart()
@@ -1239,6 +1504,15 @@ GAME = Game()
 
 def update():
     GAME.update(utime.dt)
+    # test hook: auto-drop in and auto-quit so the gameplay path can be
+    # exercised headlessly (no effect during normal play).
+    if _TEST_MODE:
+        global _TEST_T
+        _TEST_T += utime.dt
+        if GAME.state == 'menu' and _TEST_T > 0.5:
+            GAME._enter_game()
+        if _TEST_T > _TEST_QUIT:
+            application.quit()
 
 
 def input(key):
@@ -1246,5 +1520,5 @@ def input(key):
 
 
 if __name__ == '__main__':
-    GAME.start()
+    GAME.show_menu()
     app.run()
