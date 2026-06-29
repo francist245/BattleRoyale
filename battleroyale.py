@@ -345,8 +345,8 @@ class Jukebox:
             except Exception:
                 self.tracks[n] = None
 
-    def play(self, name, vol=0.42):
-        if name == self.cur:
+    def play(self, name, vol=0.42, force=False):
+        if name == self.cur and not force:
             return
         prev = self.tracks.get(self.cur)
         if prev:
@@ -356,6 +356,7 @@ class Jukebox:
         if a:
             a.volume = 0 if MUTED[0] else vol
             try:
+                a.stop()
                 a.play()
             except Exception:
                 pass
@@ -1007,7 +1008,7 @@ class Game:
         self.spawn_army(START_ENEMIES)
         self.started = True
         self.state = 'playing'
-        JUKE.play('drop')
+        JUKE.play('drop', force=True)
 
     def reset_state(self):
         self.hp = 140
@@ -1037,7 +1038,7 @@ class Game:
         self.storm_phase = 0
         self.storm_timer = 16.0
         self.storm_state = 'wait'   # wait | shrink
-        self.music_mode = 'drop'
+        self.music_mode = None      # force the music to (re)start next frame
         if getattr(self, 'dome', None):
             self.dome.scale = self.storm_r * 2
 
@@ -1307,7 +1308,7 @@ class Game:
         mouse.visible = False
         self.reset_state()
         self.spawn_army(START_ENEMIES)
-        JUKE.play('drop')
+        JUKE.play('drop', force=True)
 
     # ---------- main loop ----------
     def update(self, dt):
@@ -1420,9 +1421,9 @@ class Game:
             self.victory()
             return
 
-        # music
+        # music -- intensity scales with how many fighters remain
         nearest = dists[0][0] if dists else 999
-        if len(enemies) <= 12 or self.storm_phase >= 4:
+        if len(enemies) <= max(3, START_ENEMIES * 0.25) or self.storm_phase >= 4:
             mode = 'final'
         elif nearest < 45 or self.hurt_t > 0:
             mode = 'battle'
